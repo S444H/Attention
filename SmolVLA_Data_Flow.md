@@ -2,14 +2,14 @@
 
 本文按 **LeRobot `SmolVLAConfig` 默认参数 + SmolVLM2-500M 配置**整理 SmolVLA 的数据流动过程。
 
-为了让矩阵维度具体可读，本文使用一个默认推理样例：
+为了让矩阵维度具体可读，本文使用一个单相机推理样例：
 
 | 参数 | 数值 |
 |---|---:|
 | batch size | $1$ |
 | 相机 / 图像数量 | $1$ |
 | 图像尺寸 | $512 \times 512$ |
-| 文本长度 | padding 到 $48$ tokens |
+| 文本长度 | 记为 $L$ tokens，默认 $L \le 48$ |
 | state 维度 | padding 到 $32$ |
 | action 维度 | padding 到 $32$ |
 | action chunk size | $50$ |
@@ -28,25 +28,26 @@
 | `max_state_dim` | $32$ | robot state padding 后最大维度 |
 | `max_action_dim` | $32$ | action padding 后最大维度 |
 | `resize_imgs_with_padding` | $(512, 512)$ | 输入图像 resize 后尺寸 |
-| `tokenizer_max_length` | $48$ | 文本 token 最大长度 |
+| `tokenizer_max_length` | $48$ | 文本 token 截断上限 |
+| `pad_language_to` | `"longest"` | padding 到当前 batch 内最长文本，不会默认固定补到 $48$ |
 | `num_steps` | $10$ | flow matching 推理步数 |
 | `num_vlm_layers` | $16$ | 使用 SmolVLM2 前 $16$ 层 |
 | `expert_width_multiplier` | $0.75$ | action expert 宽度系数 |
 
 ### SmolVLM2-500M 配置
 
-| 参数 | 数值 | 含义 |
-|---|---:|---|
-| SigLIP vision hidden size | $768$ | SigLIP 视觉特征维度 |
-| image size | $512$ | 输入图像边长 |
-| patch size | $16$ | ViT patch 边长 |
-| raw patch tokens | $1024$ | 原始 patch token 数 |
-| pixel shuffle factor | $4$ | token 空间压缩倍数 |
-| visual tokens after reduction | $64$ | 压缩后的视觉 token 数 |
-| SmolLM2 hidden size | $960$ | VLM / language hidden size |
-| SmolLM2 total layers | $32$ | SmolLM2 总层数 |
-| SmolVLA used layers | $16$ | SmolVLA 使用前 $16$ 层 |
-| action expert hidden size | $720$ | $0.75 \times 960$ |
+| 参数                                  |     数值 | 含义                         |
+| ----------------------------------- | -----: | -------------------------- |
+| [SigLIP](SigLIP) vision hidden size |  $768$ | SigLIP 视觉特征维度              |
+| image size                          |  $512$ | 输入图像边长                     |
+| patch size                          |   $16$ | ViT patch 边长               |
+| raw patch tokens                    | $1024$ | 原始 patch token 数           |
+| pixel shuffle factor                |    $4$ | token 空间压缩倍数               |
+| visual tokens after reduction       |   $64$ | 压缩后的视觉 token 数             |
+| SmolLM2 hidden size                 |  $960$ | VLM / language hidden size |
+| SmolLM2 total layers                |   $32$ | SmolLM2 总层数                |
+| SmolVLA used layers                 |   $16$ | SmolVLA 使用前 $16$ 层         |
+| action expert hidden size           |  $720$ | $0.75 \times 960$          |
 
 关键维度计算：
 
@@ -77,21 +78,17 @@ $$
 SmolVLA 的整体数据流可以概括为：
 
 ```text
-图像
-  ↓
-SigLIP vision encoder
-  ↓
-visual tokens
-  ↓
-SmolLM2 / SmolVLM2 前 16 层
-  ↓
-multimodal features
-  ↓
-action expert
-  ↓
-flow matching
-  ↓
-continuous action chunk
+图像 → SigLIP → visual tokens ─┐
+文本 → token embedding        ├→ prefix → VLM 逐层 KV cache ─┐
+state → state projector       ─┘                              │
+                                                                  ├→ action expert
+噪声 action + timestep → action/time MLP → suffix ───────────────┘
+                                                                  ↓
+                                                             vector field
+                                                                  ↓
+                                                      10 步 reverse-time Euler
+                                                                  ↓
+                                                     continuous action chunk
 ```
 
 模块关系为：
@@ -109,8 +106,9 @@ $$
 其中：
 
 - SigLIP 负责把图像编码成视觉 token；
-- SmolLM2 负责融合文本、视觉、机器人状态；
-- action expert 使用 flow matching 输出连续动作 chunk。
+- SmolLM2 前 $16$ 层处理由图像、文本和 state 组成的 prefix，并产生逐层 KV cache；
+- action expert 将噪声 action 与 timestep 编码成 suffix，通过交替的 attention 读取 prefix；
+- flow matching 通过 reverse-time Euler 积分生成连续动作 chunk。
 
 ---
 
@@ -121,7 +119,7 @@ $$
 | 输入 | 矩阵 | 形状 |
 |---|---|---|
 | 图像 | $\mathbf{I}$ | $\mathbb{R}^{1 \times 3 \times 512 \times 512}$ |
-| 文本 token ids | $\mathbf{x}$ | $\mathbb{N}^{1 \times 48}$ |
+| 文本 token ids | $\mathbf{x}$ | $\mathbb{N}^{1 \times L}$，$L\le48$ |
 | robot state | $\mathbf{s}$ | $\mathbb{R}^{1 \times 32}$ |
 
 也就是：
@@ -135,7 +133,8 @@ $$
 $$
 \mathbf{x}
 \in
-\mathbb{N}^{1 \times 48}
+\mathbb{N}^{1 \times L},
+\qquad L\le48
 $$
 
 $$
@@ -210,8 +209,6 @@ $$
 \mathbf{V}
 =
 \mathbf{V}_{ps}\mathbf{W}_{v}
-+
-\mathbf{b}_{v}
 $$
 
 其中：
@@ -221,6 +218,8 @@ $$
 \in
 \mathbb{R}^{12288 \times 960}
 $$
+
+当前 SmolVLM connector 使用无 bias 的线性投影。
 
 得到 projector 后 visual tokens：
 
@@ -234,12 +233,14 @@ $$
 
 ## 5. SmolLM2 文本与多模态序列
 
-文本 instruction 被 tokenizer padding 到 $48$ 个 token：
+文本 instruction 经 tokenizer 截断到最多 $48$ 个 token。默认
+`pad_language_to="longest"`，因此序列长度是当前 batch 内的最长文本长度 $L$：
 
 $$
 \mathbf{x}
 \in
-\mathbb{N}^{1 \times 48}
+\mathbb{N}^{B \times L},
+\qquad L \le 48
 $$
 
 经过 SmolLM2 token embedding：
@@ -255,13 +256,16 @@ $$
 $$
 \mathbf{E}_{\text{text}}
 \in
-\mathbb{R}^{1 \times 48 \times 960}
+\mathbb{R}^{B \times L \times 960}
 $$
 
 其中：
 
-- $48$ 是文本 token 长度；
+- $L$ 是当前 batch padding 后的文本 token 长度，且 $L \le 48$；
 - $960$ 是 SmolLM2 hidden size。
+
+只有将 `pad_language_to` 设为 `"max_length"` 时，才会固定得到
+$L=48$。
 
 ---
 
@@ -305,87 +309,53 @@ $$
 
 ## 7. Action Expert 与 Flow Matching
 
-### 7.1 构造 VLM 输入序列
+### 7.1 构造 prefix 序列
 
-SmolVLA 将文本 token、视觉 token 和 state token 拼接：
+`embed_prefix()` 的实际拼接顺序是所有图像、文本、state：
 
 $$
-\mathbf{X}_{\text{vlm}}
+\mathbf{X}_{\text{prefix}}
 =
 [
+\mathbf{V}_1;
+\ldots;
+\mathbf{V}_C;
 \mathbf{E}_{\text{text}};
-\mathbf{V};
 \mathbf{E}_{\text{state}}
 ]
 $$
 
-序列长度为：
+默认 `add_image_special_tokens=False`，因此 prefix 长度为：
 
 $$
-48 + 64 + 1 = 113
+P = 64C + L + 1
 $$
 
-因此：
+得到：
 
 $$
-\mathbf{X}_{\text{vlm}}
+\mathbf{X}_{\text{prefix}}
 \in
-\mathbb{R}^{1 \times 113 \times 960}
+\mathbb{R}^{B \times P \times 960}
 $$
 
-### 7.2 SmolVLM2 前 16 层输出特征
+对于单相机且显式固定 $L=48$ 的样例，$P=113$。但在当前默认
+`padding="longest"` 下，$P$ 随 batch 内的实际文本长度变化。
 
-SmolVLA 使用 SmolVLM2 / SmolLM2 的前 $16$ 层作为 VLM backbone：
+attention block mask 使图像和文本不能关注后面的 state，而 state 可以关注
+前面的图像和文本。
 
-$$
-\mathbf{F}_{\text{vlm}}
-=
-f_{\text{VLM}}^{(16)}(\mathbf{X}_{\text{vlm}})
-$$
+### 7.2 VLM prefix 与逐层 KV cache
 
-输出形状保持为：
+SmolVLA 使用 SmolVLM2 / SmolLM2 前 $16$ 层处理 prefix。推理时会在每一层保存
+prefix 的 key/value cache，供每个 denoising step 重复使用。
 
-$$
-\mathbf{F}_{\text{vlm}}
-\in
-\mathbb{R}^{1 \times 113 \times 960}
-$$
+当前实现中不存在一个显式的
+$\mathbf{W}_e\in\mathbb{R}^{960\times720}$ 将整个 VLM 输出投影成
+`[B, P, 720]` 的 expert memory。action expert 而是逐层读取 VLM 的 KV cache，
+并在 cross-attention 层中使用 expert 的 K/V projection 转换它们。
 
-### 7.3 投影为 action expert memory
-
-action expert hidden size 为：
-
-$$
-0.75 \times 960 = 720
-$$
-
-VLM 特征被投影到 action expert hidden space：
-
-$$
-\mathbf{F}_{e}
-=
-\mathbf{F}_{\text{vlm}}\mathbf{W}_{e}
-+
-\mathbf{b}_{e}
-$$
-
-其中：
-
-$$
-\mathbf{W}_{e}
-\in
-\mathbb{R}^{960 \times 720}
-$$
-
-得到 expert memory：
-
-$$
-\mathbf{F}_{e}
-\in
-\mathbb{R}^{1 \times 113 \times 720}
-$$
-
-### 7.4 Action chunk 初始化
+### 7.3 Action chunk 初始化
 
 SmolVLA 输出连续动作 chunk。
 
@@ -394,19 +364,19 @@ SmolVLA 输出连续动作 chunk。
 $$
 \mathbf{a}_{t}
 \in
-\mathbb{R}^{1 \times 50 \times 32}
+\mathbb{R}^{B \times 50 \times 32}
 $$
 
 训练时，$\mathbf{a}_{t}$ 是由真实动作 chunk 和噪声插值得到的中间状态。
 
 推理时，$\mathbf{a}_{t}$ 从噪声初始化，并通过 flow matching 逐步更新。
 
-### 7.5 Action tokens
+### 7.4 Action 与 timestep tokens
 
-action chunk 被投影成 action expert token：
+action chunk 先被投影到 expert hidden size：
 
 $$
-\mathbf{Q}_{a}
+\mathbf{E}_{a}
 =
 \mathbf{a}_{t}\mathbf{W}_{a}
 +
@@ -421,49 +391,61 @@ $$
 \mathbb{R}^{32 \times 720}
 $$
 
-得到：
+同时，标量 timestep $t$ 经 sine-cosine positional encoding 得到：
 
 $$
-\mathbf{Q}_{a}
+\mathbf{E}_t
 \in
-\mathbb{R}^{1 \times 50 \times 720}
+\mathbb{R}^{B \times 50 \times 720}
 $$
 
-### 7.6 Cross-Attention 融合 VLM 信息
-
-在 action expert 中，action tokens 作为 query：
+action embedding 和 timestep embedding 在 hidden 维度上拼接，再经过两层 MLP：
 
 $$
-\mathbf{Q}
+\operatorname{Concat}_{-1}(\mathbf{E}_a,\mathbf{E}_t)
 \in
-\mathbb{R}^{1 \times 50 \times 720}
+\mathbb{R}^{B \times 50 \times 1440}
+\rightarrow
+\operatorname{Linear}
+\rightarrow
+\operatorname{SiLU}
+\rightarrow
+\operatorname{Linear}
 $$
 
-expert memory 作为 key / value：
+最终得到 action expert suffix：
 
 $$
-\mathbf{K}, \mathbf{V}
+\mathbf{X}_{\text{suffix}}
 \in
-\mathbb{R}^{1 \times 113 \times 720}
+\mathbb{R}^{B \times 50 \times 720}
 $$
 
-cross-attention 的权重矩阵形状为：
+### 7.5 Action expert 的交替 attention
+
+默认 `attention_mode="cross_attn"` 且 `self_attn_every_n_layers=2`。因此
+$16$ 层中交替使用两种 attention：
+
+- 偶数层使用 action suffix self-attention，推理时 action query 同时读取
+  prefix KV cache 和带 causal mask 的 action KV；
+- 奇数层使用 cross-attention，action query 只读取 prefix KV cache。
+
+对 SmolVLM2-500M，attention head 数为 $15$。若忽略 GQA 在内部对 K/V head
+的扩展过程，attention score 形状为：
 
 $$
-\mathbf{Q}\mathbf{K}^{\top}
+\text{cross-attention score}
 \in
-\mathbb{R}^{1 \times 50 \times 113}
+\mathbb{R}^{B \times 15 \times 50 \times P}
 $$
 
-attention 输出为：
-
 $$
-\operatorname{Attention}(\mathbf{Q}, \mathbf{K}, \mathbf{V})
+\text{self-attention score}
 \in
-\mathbb{R}^{1 \times 50 \times 720}
+\mathbb{R}^{B \times 15 \times 50 \times (P+50)}
 $$
 
-### 7.7 输出 vector field
+### 7.6 输出 vector field
 
 action expert 输出 flow matching 的 vector field：
 
@@ -474,7 +456,7 @@ F_{\theta}
 (
 \mathbf{a}_{t},
 t,
-\mathbf{F}_{e}
+\operatorname{KV}_{\text{prefix}}
 )
 $$
 
@@ -483,12 +465,38 @@ $$
 $$
 \mathbf{v}_{\theta}
 \in
-\mathbb{R}^{1 \times 50 \times 32}
+\mathbb{R}^{B \times 50 \times 32}
 $$
 
-### 7.8 Flow Matching 更新动作
+### 7.7 Flow Matching 训练目标
 
-推理时默认使用 $10$ 个 flow matching steps。
+训练时，数据 action 记为 $\mathbf{a}$，高斯噪声记为 $\boldsymbol{\epsilon}$。
+当前实现使用：
+
+$$
+\mathbf{x}_t
+=
+t\boldsymbol{\epsilon}+(1-t)\mathbf{a}
+$$
+
+目标 vector field 为：
+
+$$
+\mathbf{u}_t
+=
+\boldsymbol{\epsilon}-\mathbf{a}
+$$
+
+优化目标是 $\mathbf{v}_\theta(\mathbf{x}_t,t)$ 与 $\mathbf{u}_t$ 之间的 MSE。
+
+### 7.8 Flow Matching 推理更新
+
+推理从 $t=1$ 的高斯噪声开始，向 $t=0$ 积分。默认使用
+$10$ 个 Euler steps：
+
+$$
+\Delta t=-\frac{1}{10}
+$$
 
 每一步根据 vector field 更新动作：
 
@@ -505,8 +513,10 @@ $$
 $$
 \hat{\mathbf{a}}
 \in
-\mathbb{R}^{1 \times 50 \times 32}
+\mathbb{R}^{B \times 50 \times 32}
 $$
+
+模型 wrapper 最后会将 $32$ 维 padding 裁剪回数据集的真实 action 维度。
 
 ---
 
@@ -515,23 +525,23 @@ $$
 | 阶段 | 张量 | 形状 |
 |---|---|---|
 | 输入图像 | $\mathbf{I}$ | $\mathbb{R}^{1 \times 3 \times 512 \times 512}$ |
-| 文本 token ids | $\mathbf{x}$ | $\mathbb{N}^{1 \times 48}$ |
+| 文本 token ids | $\mathbf{x}$ | $\mathbb{N}^{1 \times L}$，$L\le48$ |
 | robot state | $\mathbf{s}$ | $\mathbb{R}^{1 \times 32}$ |
 | SigLIP raw patch features | $\mathbf{P}$ | $\mathbb{R}^{1 \times 1024 \times 768}$ |
 | pixel shuffle 后视觉特征 | $\mathbf{V}_{ps}$ | $\mathbb{R}^{1 \times 64 \times 12288}$ |
 | projector 后 visual tokens | $\mathbf{V}$ | $\mathbb{R}^{1 \times 64 \times 960}$ |
-| 文本 token embeddings | $\mathbf{E}_{\text{text}}$ | $\mathbb{R}^{1 \times 48 \times 960}$ |
+| 文本 token embeddings | $\mathbf{E}_{\text{text}}$ | $\mathbb{R}^{1 \times L \times 960}$ |
 | state token | $\mathbf{E}_{\text{state}}$ | $\mathbb{R}^{1 \times 1 \times 960}$ |
-| VLM 输入序列 | $\mathbf{X}_{\text{vlm}}$ | $\mathbb{R}^{1 \times 113 \times 960}$ |
-| VLM 输出特征 | $\mathbf{F}_{\text{vlm}}$ | $\mathbb{R}^{1 \times 113 \times 960}$ |
-| expert memory | $\mathbf{F}_{e}$ | $\mathbb{R}^{1 \times 113 \times 720}$ |
+| prefix embeddings | $\mathbf{X}_{\text{prefix}}$ | $\mathbb{R}^{1 \times P \times 960}$，$P=64+L+1$ |
+| 逐层 prefix memory | $\operatorname{KV}_{\text{prefix}}$ | VLM 每层的 K/V cache |
 | 噪声 / 中间 action chunk | $\mathbf{a}_{t}$ | $\mathbb{R}^{1 \times 50 \times 32}$ |
-| action tokens | $\mathbf{Q}_{a}$ | $\mathbb{R}^{1 \times 50 \times 720}$ |
-| cross-attention score | $\mathbf{Q}\mathbf{K}^{\top}$ | $\mathbb{R}^{1 \times 50 \times 113}$ |
+| action + timestep suffix | $\mathbf{X}_{\text{suffix}}$ | $\mathbb{R}^{1 \times 50 \times 720}$ |
+| cross-attention score |  | $\mathbb{R}^{1 \times 15 \times 50 \times P}$ |
+| self-attention score |  | $\mathbb{R}^{1 \times 15 \times 50 \times (P+50)}$ |
 | vector field | $\mathbf{v}_{\theta}$ | $\mathbb{R}^{1 \times 50 \times 32}$ |
 | final action chunk | $\hat{\mathbf{a}}$ | $\mathbb{R}^{1 \times 50 \times 32}$ |
 
-整体链路可以压缩表示为：
+整体链路可以压缩表示为两条输入分支：
 
 $$
 \mathbf{I}
@@ -542,18 +552,28 @@ $$
 \rightarrow
 \mathbf{V}
 \rightarrow
-\mathbf{X}_{\text{vlm}}
+\mathbf{X}_{\text{prefix}}
 \rightarrow
-\mathbf{F}_{\text{vlm}}
+\operatorname{KV}_{\text{prefix}}
+$$
+
+$$
+(\mathbf{a}_t,t)
 \rightarrow
-\mathbf{F}_{e}
+\mathbf{X}_{\text{suffix}}
+$$
+
+两条分支在 action expert 中汇合：
+
+$$
+(\operatorname{KV}_{\text{prefix}},\mathbf{X}_{\text{suffix}})
 \rightarrow
 \mathbf{v}_{\theta}
 \rightarrow
 \hat{\mathbf{a}}
 $$
 
-对应形状为：
+关键形状为：
 
 $$
 \mathbb{R}^{1 \times 3 \times 512 \times 512}
@@ -564,14 +584,18 @@ $$
 \rightarrow
 \mathbb{R}^{1 \times 64 \times 960}
 \rightarrow
-\mathbb{R}^{1 \times 113 \times 960}
-\rightarrow
-\mathbb{R}^{1 \times 113 \times 960}
-\rightarrow
-\mathbb{R}^{1 \times 113 \times 720}
-\rightarrow
+\mathbb{R}^{1 \times P \times 960}
+\xrightarrow{\text{per-layer KV cache}}
+\operatorname{KV}_{\text{prefix}}
+$$
+
+$$
 \mathbb{R}^{1 \times 50 \times 32}
-\rightarrow
+\xrightarrow{\text{action/time MLP}}
+\mathbb{R}^{1 \times 50 \times 720}
+\xrightarrow{\text{expert + output projection}}
+\mathbb{R}^{1 \times 50 \times 32}
+\xrightarrow{\text{Euler integration}}
 \mathbb{R}^{1 \times 50 \times 32}
 $$
 
@@ -589,35 +613,31 @@ $$
 \mathbb{R}^{1 \times 64C \times 960}
 $$
 
-VLM 输入序列长度变为：
+prefix 序列长度变为：
 
 $$
-48 + 64C + 1
+P = 64C + L + 1,
+\qquad L\le48
 $$
 
 因此：
 
 $$
-\mathbf{X}_{\text{vlm}}
+\mathbf{X}_{\text{prefix}}
 \in
-\mathbb{R}^{1 \times (48 + 64C + 1) \times 960}
+\mathbb{R}^{1 \times (64C + L + 1) \times 960}
 $$
 
-也就是：
+如果显式使用 `padding="max_length"` 令 $L=48$，才可以简化为：
 
 $$
-\mathbf{X}_{\text{vlm}}
+\mathbf{X}_{\text{prefix}}
 \in
 \mathbb{R}^{1 \times (49 + 64C) \times 960}
 $$
 
-对应的 expert memory 为：
-
-$$
-\mathbf{F}_{e}
-\in
-\mathbb{R}^{1 \times (49 + 64C) \times 720}
-$$
+每层 KV cache 的序列长度也随 $P$ 变化；不存在一个独立的
+`[1, P, 720]` expert-memory 张量。
 
 action 侧不随相机数变化，仍为：
 
@@ -634,7 +654,13 @@ $$
 本文使用的关键维度满足：
 
 $$
-48 + 64 + 1 = 113
+P=64C+L+1
+$$
+
+对于单相机、显式固定 $L=48$ 的特例：
+
+$$
+P=64+48+1=113
 $$
 
 $$
@@ -657,16 +683,19 @@ $$
 960 \times 0.75 = 720
 $$
 
-因此，默认单相机样例的数据流为：
+因此，默认单相机数据流应表示为：
 
 ```text
 image:        1 x 3 x 512 x 512
 patches:      1 x 1024 x 768
 visual:       1 x 64 x 960
-text:         1 x 48 x 960
+text:         1 x L x 960, L <= 48
 state:        1 x 1 x 960
-vlm input:    1 x 113 x 960
-expert memory:1 x 113 x 720
-action tokens:1 x 50 x 720
+prefix:       1 x P x 960, P = 64 + L + 1
+prefix memory:per-layer KV cache
+action suffix:1 x 50 x 720
 output:       1 x 50 x 32
 ```
+
+其中 action suffix 在 $16$ 层 expert 中交替执行 self-attention 和
+prefix cross-attention，最后经 `action_out_proj` 生成 vector field。
