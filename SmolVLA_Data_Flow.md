@@ -38,7 +38,7 @@
 
 | 参数                                  |     数值 | 含义                         |
 | ----------------------------------- | -----: | -------------------------- |
-| [SigLIP](SigLIP) vision hidden size |  $768$ | SigLIP 视觉特征维度              |
+| [CLIP 与 SigLIP](CLIP%20与%20SigLIP.md) vision hidden size |  $768$ | SigLIP 视觉特征维度              |
 | image size                          |  $512$ | 输入图像边长                     |
 | patch size                          |   $16$ | ViT patch 边长               |
 | raw patch tokens                    | $1024$ | 原始 patch token 数           |
